@@ -6,8 +6,10 @@ Geocodes addresses using Nominatim first, then falls back to Google
 when Nominatim returns no results or low confidence results.
 
 Usage:
-    python scripts/02_geocode_hybrid.py --limit 5  # Test with 5 rows
-    python scripts/02_geocode_hybrid.py            # Process all rows
+    python scripts/02_geocode_hybrid.py --limit 5              # Test with 5 rows
+    python scripts/02_geocode_hybrid.py                        # Process all rows
+    python scripts/02_geocode_hybrid.py --municipality_limit ВРАЦА  # Only ВРАЦА municipality
+    python scripts/02_geocode_hybrid.py --municipality_limit ВРАЦА --limit 10  # ВРАЦА, max 10 rows
 """
 
 import argparse
@@ -362,13 +364,14 @@ def load_config(config_path="config/config.yaml"):
         return yaml.safe_load(f)
 
 
-def geocode_records(config, limit=None):
+def geocode_records(config, limit=None, municipality_limit=None):
     """
     Geocode records using hybrid approach (Nominatim first, then Google).
     
     Args:
         config: Configuration dictionary
         limit: Maximum number of records to process (None for all)
+        municipality_limit: Filter by municipality name (partial match)
     """
     # Initialize geocoders
     nominatim = NominatimGeocoder(
@@ -387,26 +390,36 @@ def geocode_records(config, limit=None):
     # Get records that need geocoding
     print("[*] Finding records to geocode...")
     
+    # Build query based on filters
+    where_clauses = ["nom_queried_at IS NULL"]
+    params = {}
+    
+    if municipality_limit:
+        where_clauses.append("municipality ILIKE :municipality")
+        params['municipality'] = f'%{municipality_limit}%'
+        print(f"[*] Filtering by municipality: {municipality_limit}")
+    
+    where_sql = " AND ".join(where_clauses)
+    
     with engine.connect() as conn:
-        # Find records where Nominatim hasn't been queried yet
-        query = text("""
-            SELECT id, address_query, settlement, municipality
-            FROM community_centers
-            WHERE nom_queried_at IS NULL
-            ORDER BY id
-        """)
-        
         if limit:
-            query = text("""
+            query = text(f"""
                 SELECT id, address_query, settlement, municipality
                 FROM community_centers
-                WHERE nom_queried_at IS NULL
+                WHERE {where_sql}
                 ORDER BY id
                 LIMIT :limit
             """)
-            result = conn.execute(query, {'limit': limit})
+            params['limit'] = limit
+            result = conn.execute(query, params)
         else:
-            result = conn.execute(query)
+            query = text(f"""
+                SELECT id, address_query, settlement, municipality
+                FROM community_centers
+                WHERE {where_sql}
+                ORDER BY id
+            """)
+            result = conn.execute(query, params)
         
         records = result.fetchall()
     
@@ -601,6 +614,12 @@ def main():
         default=None,
         help='Limit number of records to process (for testing)'
     )
+    parser.add_argument(
+        '--municipality_limit',
+        type=str,
+        default=None,
+        help='Filter by municipality name (partial match, e.g., "ВРАЦА")'
+    )
     
     args = parser.parse_args()
     
@@ -614,7 +633,7 @@ def main():
     config = load_config(args.config)
     
     # Run geocoding
-    geocode_records(config, limit=args.limit)
+    geocode_records(config, limit=args.limit, municipality_limit=args.municipality_limit)
 
 
 if __name__ == '__main__':

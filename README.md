@@ -70,6 +70,17 @@ python scripts/02_geocode_hybrid.py --limit 5
 
 # Test with 50 records
 python scripts/02_geocode_hybrid.py --limit 50
+
+# Test with specific municipality (filter by name)
+python scripts/02_geocode_hybrid.py --municipality_limit "ВАРНА" --limit 10
+
+# Process all records from a specific municipality
+python scripts/02_geocode_hybrid.py --municipality_limit "ПЛОВДИВ"
+```
+
+**Note for Windows users with Cyrillic:** If you encounter encoding issues in PowerShell, use CMD instead:
+```cmd
+cmd /c python scripts/02_geocode_hybrid.py --municipality_limit "ВАРНА" --limit 10
 ```
 
 **Process all records:**
