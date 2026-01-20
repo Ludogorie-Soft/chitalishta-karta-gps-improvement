@@ -60,45 +60,66 @@ def normalize_address_query(row):
     """
     Build normalized address query string for geocoding.
     
-    Format: "<street_part>, <settlement>, <municipality>, България <postcode_optional>"
+    Format: "<street>, <settlement>, <municipality>, България"
     
     Example:
-        "ул. Васил Левски 43, Старцево, Златоград, България 4987"
+        "ул. Васил Левски 43, Старцево, Златоград, България"
     """
+    import re
+    
     parts = []
     
-    # Get the address (street part)
+    # Get the raw address
     address = clean_text(row.get('address_raw'))
-    if address:
-        # Basic cleaning: remove common prefixes like "община", "град", "село"
-        address_lower = address.lower()
-        
-        # Remove leading administrative tokens
-        prefixes_to_remove = [
-            'община ', 'град ', 'село ', 'с. ', 'гр. ', 'жк. ', 'кв. '
-        ]
-        for prefix in prefixes_to_remove:
-            if address_lower.startswith(prefix):
-                address = address[len(prefix):]
-                address_lower = address.lower()
-        
-        parts.append(address)
     
-    # Add settlement
+    # Extract street part (from "ул." onwards, but exclude administrative prefixes)
+    street_part = None
+    if address:
+        # Find where the actual street address starts
+        street_markers = ['ул.', 'бул.', 'пл.', 'кв.', 'жк.']
+        for marker in street_markers:
+            if marker in address.lower():
+                # Find the position of the marker
+                idx = address.lower().find(marker)
+                # Extract from marker to end
+                street_part = address[idx:].strip()
+                
+                # Remove postal code (п.к. XXXX)
+                street_part = re.sub(r',?\s*п\.к\.\s*\d+', '', street_part)
+                
+                # Clean up extra spaces and commas
+                street_part = re.sub(r'\s+', ' ', street_part).strip()
+                break
+    
+    if street_part:
+        parts.append(street_part)
+    
+    # Clean settlement name (remove СЕЛО/ГРАД prefix)
     settlement = clean_text(row.get('settlement'))
     if settlement:
-        parts.append(settlement)
+        settlement_clean = settlement
+        # Remove prefixes
+        for prefix in ['СЕЛО ', 'ГРАД ', 'С. ', 'ГР. ']:
+            if settlement_clean.startswith(prefix):
+                settlement_clean = settlement_clean[len(prefix):].strip()
+        
+        if settlement_clean:
+            parts.append(settlement_clean)
     
-    # Add municipality (if different from settlement)
+    # Clean municipality name (usually doesn't have prefixes)
     municipality = clean_text(row.get('municipality'))
-    if municipality and municipality != settlement:
+    settlement_clean_upper = settlement_clean.upper() if settlement and settlement_clean else ''
+    municipality_upper = municipality.upper() if municipality else ''
+    
+    # Only add municipality if different from settlement
+    if municipality and municipality_upper != settlement_clean_upper:
         parts.append(municipality)
     
     # Add country
     parts.append('България')
     
     # Join with comma-space
-    query = ', '.join(parts)
+    query = ', '.join(parts) if parts else None
     
     return query
 

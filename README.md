@@ -52,12 +52,103 @@ Import the Excel file:
 python scripts/01_import_excel_to_pg.py --xlsx chitalishta_gps_coordinates.xlsx
 ```
 
+This will:
+- Import all 3,601 records from Excel
+- Clean coordinates (convert comma to dot)
+- Build normalized address queries
+- Store data in PostgreSQL
+
+### 5. Geocode Addresses
+
+Geocode addresses using the hybrid approach (Nominatim first, Google fallback):
+
+**Test with a small sample first (recommended):**
+
+```bash
+# Test with 5 records
+python scripts/02_geocode_hybrid.py --limit 5
+
+# Test with 50 records
+python scripts/02_geocode_hybrid.py --limit 50
+```
+
+**Process all records:**
+
+```bash
+python scripts/02_geocode_hybrid.py
+```
+
+**What this script does:**
+- Queries **Nominatim** first with multiple fallback strategies:
+  1. Full address (street + settlement + municipality)
+  2. Settlement + municipality (if street address fails)
+  3. Just settlement (if still no results)
+- Calls **Google Geocoding API** as fallback when:
+  - Nominatim returns no results, OR
+  - Nominatim confidence is low (< 60)
+- Stores **all results** in the database (including failed attempts)
+- Uses **SQLite caching** to avoid duplicate API calls
+- Respects **rate limits**: 1 request/second for Nominatim
+
+**Expected runtime:**
+- With 3,601 records and rate limiting: ~1-2 hours
+- The script will show a progress bar
+- You can stop and restart anytime (it won't re-query already processed records)
+
+**Results:**
+- All Nominatim results stored in `lon_nom`, `lat_nom`, `nom_*` columns
+- All Google results stored in `lon_g`, `lat_g`, `g_*` columns
+- Raw API responses stored in `nom_raw_json` and `g_raw_json`
+
 ## Scripts
 
 1. **01_import_excel_to_pg.py** - Import Excel data into PostgreSQL
-2. **02_geocode_hybrid.py** - Geocode using Nominatim first, then Google fallback (coming soon)
+2. **02_geocode_hybrid.py** - Geocode using Nominatim first, then Google fallback
 3. **03_compute_distances.py** - Compute distances and assign status (coming soon)
 4. **04_export_review_csv.py** - Export records needing review (coming soon)
+
+## Cache Management
+
+The geocoding scripts cache all API responses to avoid duplicate requests:
+- `data/cache/nominatim_cache.sqlite` - Nominatim responses
+- `data/cache/google_cache.sqlite` - Google responses
+
+To clear the cache (if you want to re-geocode):
+
+```bash
+# Windows
+Remove-Item -Path "data\cache\*.sqlite" -Force
+
+# Linux/Mac
+rm -f data/cache/*.sqlite
+```
+
+## Checking Results
+
+After geocoding, you can check the results in DBeaver or using SQL:
+
+```bash
+# View geocoding statistics
+docker exec chitalishta_maps_db psql -U postgres -d chitalishta_maps -c "
+  SELECT 
+    COUNT(*) as total,
+    COUNT(nom_queried_at) as nominatim_queried,
+    COUNT(CASE WHEN lon_nom IS NOT NULL THEN 1 END) as nominatim_found,
+    COUNT(g_queried_at) as google_queried,
+    COUNT(CASE WHEN lon_g IS NOT NULL THEN 1 END) as google_found
+  FROM community_centers;
+"
+
+# View sample results
+docker exec chitalishta_maps_db psql -U postgres -d chitalishta_maps -c "
+  SELECT id, name, settlement, 
+         lon_nom, lat_nom, nom_confidence,
+         lon_g, lat_g, g_confidence
+  FROM community_centers
+  WHERE nom_queried_at IS NOT NULL
+  LIMIT 10;
+"
+```
 
 ## Database Connection
 
