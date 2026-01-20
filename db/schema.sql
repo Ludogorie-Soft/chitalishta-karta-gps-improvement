@@ -10,9 +10,14 @@ DROP TABLE IF EXISTS community_centers CASCADE;
 -- Create main table
 CREATE TABLE community_centers (
     -- ========================================
+    -- PRIMARY KEY (auto-increment)
+    -- ========================================
+    id SERIAL PRIMARY KEY,
+    
+    -- ========================================
     -- SOURCE FIELDS (from Excel)
     -- ========================================
-    fid INTEGER PRIMARY KEY,
+    fid INTEGER,  -- Not unique, from Excel
     name TEXT,
     address_raw TEXT,
     settlement TEXT,

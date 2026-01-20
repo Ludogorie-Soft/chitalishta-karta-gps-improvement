@@ -1,0 +1,26 @@
+# Excel reading
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Configuration
+pyyaml>=6.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Retry logic
+tenacity>=8.2.0
+
+# Geospatial calculations
+geopy>=2.3.0
+
+# Optional: for local geometry operations (PostGIS handles most of it)
+# shapely>=2.0.0
+
