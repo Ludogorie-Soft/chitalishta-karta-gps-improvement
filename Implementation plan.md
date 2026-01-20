@@ -86,8 +86,8 @@ Create a single main table: `community_centers`
 - `address_query` (text) — normalized query string used for geocoding
 
 **Nominatim result**
-- `lon_nom` / `lat_nom` (double precision)
-- `geom_nom` (geometry(Point, 4326))
+- `lon_nom` / `lat_nom` (double precision) — NULL if no result found
+- `geom_nom` (geometry(Point, 4326)) — NULL if no result found
 - `nom_display_name` (text)
 - `nom_osm_type` (text)
 - `nom_osm_id` (bigint)
@@ -95,17 +95,19 @@ Create a single main table: `community_centers`
 - `nom_class` (text)
 - `nom_type` (text)
 - `nom_confidence` (smallint 0–100, your computed score)
-- `nom_raw_json` (jsonb)
+- `nom_raw_json` (jsonb) — **Always populated after query** (even if empty result)
+- `nom_queried_at` (timestamptz) — timestamp of Nominatim query attempt
 
 **Google result**
-- `lon_g` / `lat_g` (double precision)
-- `geom_g` (geometry(Point, 4326))
+- `lon_g` / `lat_g` (double precision) — NULL if no result found
+- `geom_g` (geometry(Point, 4326)) — NULL if no result found
 - `g_formatted_address` (text)
 - `g_place_id` (text)
 - `g_location_type` (text)
 - `g_types` (jsonb)
 - `g_confidence` (smallint 0–100)
-- `g_raw_json` (jsonb)
+- `g_raw_json` (jsonb) — **Always populated after query** (even if empty result)
+- `g_queried_at` (timestamptz) — timestamp of Google query attempt
 
 **Distances (meters)**
 - `dist_src_nom_m` (double precision)
@@ -215,17 +217,28 @@ You don’t need perfect parsing — consistency matters more.
 
 ### Scope
 Only process rows where:
-- `lat_nom/lon_nom IS NULL` **OR**
-- `lat_g/lon_g IS NULL`
+- `nom_queried_at IS NULL` (Nominatim not yet attempted) **OR**
+- `g_queried_at IS NULL` (Google not yet attempted, if needed)
 
-(i.e. do not re-geocode filled records)
+(i.e. do not re-geocode records that have already been queried)
+
+**Important**: Results are stored in DB even if geocoding fails or returns low confidence.
+- `nom_raw_json` is always populated after Nominatim query (even if empty/failed)
+- `nom_queried_at` timestamp marks that we attempted the query
+- Same applies for Google results (`g_raw_json`, `g_queried_at`)
+This ensures we never query the same address twice.
 
 ### Workflow per record
 1. Build the `address_query` if missing
 2. **Try Nominatim**
-3. Compute Nominatim confidence score
-4. If `not_found` or `low_confidence` → **call Google**
-5. Store results + raw JSON in DB
+3. **Store Nominatim result in DB** (always, even if empty or low-confidence)
+   - Update columns: `lon_nom`, `lat_nom`, `geom_nom`, `nom_display_name`, `nom_raw_json`, etc.
+   - If Nominatim returns no results → store `NULL` for coordinates but keep raw JSON response
+   - This prevents re-querying and provides an audit trail
+4. Compute Nominatim confidence score
+5. If `not_found` or `low_confidence` → **call Google**
+6. **Store Google result in DB** (if called, always store even if empty)
+   - Update columns: `lon_g`, `lat_g`, `geom_g`, `g_formatted_address`, `g_raw_json`, etc.
 
 ### 7.1 Nominatim request
 Query params:
@@ -241,6 +254,8 @@ Rate limit:
 
 Caching:
 - SQLite cache keyed by `address_query`
+- **Cache ALL responses** (including empty/failed results) to prevent re-querying
+- Cache structure: `(address_query TEXT PRIMARY KEY, response_json TEXT, timestamp DATETIME)`
 
 ### 7.2 Nominatim confidence scoring (example heuristic)
 Return 0–100 score based on:
@@ -268,6 +283,23 @@ Also store:
 
 Caching:
 - SQLite cache keyed by `address_query`
+- **Cache ALL responses** (including empty/failed results) to prevent re-querying
+
+### 7.4 Critical: Store ALL results regardless of quality
+
+**Both database and cache storage follow this rule:**
+- ✅ Store result if Nominatim/Google returns coordinates
+- ✅ Store result if Nominatim/Google returns empty/no results  
+- ✅ Store result if confidence is low
+- ✅ Store result if address seems wrong
+- ✅ Always update `nom_raw_json`/`g_raw_json` with full API response
+- ✅ Always update `nom_queried_at`/`g_queried_at` timestamp
+
+**Why?**
+- Prevents duplicate API calls to bad addresses
+- Provides complete audit trail
+- Allows manual review of what went wrong
+- Respects API rate limits by not retrying known failures
 
 ---
 
