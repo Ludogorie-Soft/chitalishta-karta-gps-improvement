@@ -1,0 +1,40 @@
+# Configuration with secrets
+config/config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Cache files
+data/cache/
+*.sqlite
+*.db
+
+# Data files (Excel input may contain sensitive information)
+data/*.xlsx
+data/*.xls
+data/*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+

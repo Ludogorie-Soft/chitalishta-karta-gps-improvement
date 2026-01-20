@@ -1,0 +1,39 @@
+# Chitalishta Geocoder Configuration (Example)
+# Copy this file to config.yaml and fill in your actual values
+
+# Database connection
+db:
+  # Connection string for PostgreSQL with PostGIS
+  url: "postgresql+psycopg2://postgres:postgres@localhost:5436/chitalishta_maps"
+
+# Google Geocoding API
+google:
+  # Get your API key from: https://console.cloud.google.com/apis/credentials
+  api_key: "YOUR_GOOGLE_API_KEY_HERE"
+
+# Nominatim (OpenStreetMap) settings
+nominatim:
+  # Base URL for Nominatim API
+  base_url: "https://nominatim.openstreetmap.org/search"
+  
+  # User-Agent is REQUIRED by Nominatim usage policy
+  # Format: "app-name/version (contact-email)"
+  user_agent: "chitalishta-geocoder/1.0 (your-email@example.com)"
+  
+  # Rate limiting: 1 request per second (Nominatim policy)
+  rate_limit_seconds: 1.0
+
+# Distance thresholds (in meters)
+thresholds:
+  # Distance threshold for considering result "OK"
+  # If geocoded point is within this distance from source, it's good
+  ok_distance_m: 1000
+  
+  # Distance threshold for suspicious results
+  # Beyond this distance, result is marked as "mismatch"
+  suspicious_distance_m: 5000
+  
+  # Minimum confidence score to accept a result without review
+  # Scale: 0-100
+  min_confidence: 60
+
