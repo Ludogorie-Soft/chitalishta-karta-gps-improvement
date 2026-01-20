@@ -4,6 +4,7 @@ Script 03: Compute Distances and Assign Status
 
 Computes distances between source, Nominatim, and Google coordinates,
 then assigns status and selects the best coordinate for each record.
+Includes settlement name validation.
 
 Usage:
     python scripts/03_compute_distances.py
@@ -11,6 +12,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
@@ -44,6 +46,134 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     r = 6371000
     
     return c * r
+
+
+def cyrillic_to_latin(text):
+    """
+    Transliterate Cyrillic to Latin (Bulgarian).
+    
+    Args:
+        text: Cyrillic text
+        
+    Returns:
+        Latin transliteration
+    """
+    transliteration_map = {
+        'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ж': 'Zh',
+        'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M', 'Н': 'N',
+        'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U', 'Ф': 'F',
+        'Х': 'H', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Sht', 'Ъ': 'A', 'Ь': 'Y',
+        'Ю': 'Yu', 'Я': 'Ya',
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ж': 'zh',
+        'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
+        'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f',
+        'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sht', 'ъ': 'a', 'ь': 'y',
+        'ю': 'yu', 'я': 'ya'
+    }
+    
+    result = []
+    for char in text:
+        result.append(transliteration_map.get(char, char))
+    return ''.join(result)
+
+
+def normalize_settlement_name(settlement):
+    """
+    Normalize settlement name for comparison.
+    
+    - Strip prefixes (СЕЛО, ГРАД, С., ГР.)
+    - Convert to uppercase
+    - Trim whitespace
+    
+    Args:
+        settlement: Raw settlement name
+        
+    Returns:
+        Normalized name (uppercase, no prefixes)
+    """
+    if not settlement:
+        return None
+    
+    # Convert to uppercase
+    normalized = settlement.upper().strip()
+    
+    # Remove prefixes
+    prefixes = ['СЕЛО ', 'ГРАД ', 'С. ', 'ГР. ', 'С.', 'ГР.']
+    for prefix in prefixes:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].strip()
+    
+    return normalized
+
+
+def extract_settlement_from_address(address_string):
+    """
+    Extract settlement name from Nominatim display_name or Google formatted_address.
+    
+    Returns first part before comma (usually the settlement).
+    
+    Args:
+        address_string: Full address string
+        
+    Returns:
+        Settlement name (uppercase) or None
+    """
+    if not address_string:
+        return None
+    
+    # Split by comma and take first part
+    parts = address_string.split(',')
+    if parts:
+        settlement = parts[0].strip().upper()
+        return settlement
+    
+    return None
+
+
+def settlement_matches(expected_settlement, address_string):
+    """
+    Check if expected settlement appears in the address string.
+    
+    Tries:
+    1. Cyrillic match (case-insensitive)
+    2. Latin transliteration match
+    
+    Args:
+        expected_settlement: Expected settlement name (from Excel, normalized)
+        address_string: Full address string from geocoder
+        
+    Returns:
+        True if settlement found in address, False otherwise
+    """
+    if not expected_settlement or not address_string:
+        return False
+    
+    # Normalize for comparison
+    address_upper = address_string.upper()
+    expected_upper = expected_settlement.upper()
+    
+    # 1. Try Cyrillic match
+    if expected_upper in address_upper:
+        return True
+    
+    # 2. Try Latin transliteration
+    expected_latin = cyrillic_to_latin(expected_upper)
+    
+    # Also transliterate address in case it's mixed
+    address_latin = cyrillic_to_latin(address_upper)
+    
+    if expected_latin in address_latin:
+        return True
+    
+    # Try with common variations
+    # Remove spaces and try again
+    expected_no_space = expected_latin.replace(' ', '')
+    address_no_space = address_latin.replace(' ', '')
+    
+    if expected_no_space in address_no_space:
+        return True
+    
+    return False
 
 
 def load_config(config_path="config/config.yaml"):
@@ -80,9 +210,10 @@ def compute_distances_and_status(config, limit=None):
     with engine.connect() as conn:
         query = text("""
             SELECT id, 
+                   settlement,
                    lon_src, lat_src,
-                   lon_nom, lat_nom, nom_confidence,
-                   lon_g, lat_g, g_confidence
+                   lon_nom, lat_nom, nom_confidence, nom_display_name,
+                   lon_g, lat_g, g_confidence, g_formatted_address
             FROM community_centers
             ORDER BY id
         """)
@@ -90,9 +221,10 @@ def compute_distances_and_status(config, limit=None):
         if limit:
             query = text("""
                 SELECT id, 
+                       settlement,
                        lon_src, lat_src,
-                       lon_nom, lat_nom, nom_confidence,
-                       lon_g, lat_g, g_confidence
+                       lon_nom, lat_nom, nom_confidence, nom_display_name,
+                       lon_g, lat_g, g_confidence, g_formatted_address
                 FROM community_centers
                 ORDER BY id
                 LIMIT :limit
@@ -110,8 +242,8 @@ def compute_distances_and_status(config, limit=None):
         'ok': 0,
         'needs_review': 0,
         'mismatch': 0,
+        'settlement_mismatch': 0,
         'not_found': 0,
-        'best_src': 0,
         'best_nominatim': 0,
         'best_google': 0
     }
@@ -120,12 +252,23 @@ def compute_distances_and_status(config, limit=None):
     for record in tqdm(records, desc="Computing distances"):
         record_id = record.id
         
+        # Extract settlement
+        expected_settlement = normalize_settlement_name(record.settlement)
+        
         # Extract coordinates
         lon_src, lat_src = record.lon_src, record.lat_src
         lon_nom, lat_nom = record.lon_nom, record.lat_nom
         lon_g, lat_g = record.lon_g, record.lat_g
         nom_confidence = record.nom_confidence or 0
         g_confidence = record.g_confidence or 0
+        
+        # Get address strings for settlement validation
+        nom_display_name = record.nom_display_name
+        g_formatted_address = record.g_formatted_address
+        
+        # Validate settlement match
+        nom_settlement_match = settlement_matches(expected_settlement, nom_display_name) if expected_settlement and nom_display_name else None
+        g_settlement_match = settlement_matches(expected_settlement, g_formatted_address) if expected_settlement and g_formatted_address else None
         
         # Compute distances
         dist_src_nom_m = haversine_distance(lat_src, lon_src, lat_nom, lon_nom) if all([lat_src, lon_src, lat_nom, lon_nom]) else None
@@ -147,94 +290,163 @@ def compute_distances_and_status(config, limit=None):
         if not has_nom and not has_google:
             # No geocoding results at all
             status = 'not_found'
+            best_provider = None
+            best_lon = None
+            best_lat = None
             notes.append('No geocoding results from Nominatim or Google')
-            if has_src:
-                # Use source coordinates as fallback
-                best_provider = 'src'
-                best_lon = lon_src
-                best_lat = lat_src
-                notes.append('Using source coordinates as fallback')
         
         elif has_src:
             # We have source coordinates - use them to validate
             
-            # Check Nominatim first
-            nom_valid = has_nom and dist_src_nom_m is not None and dist_src_nom_m <= ok_distance_m and nom_confidence >= min_confidence
-            
-            # Check Google
-            g_valid = has_google and dist_src_g_m is not None and dist_src_g_m <= ok_distance_m and g_confidence >= min_confidence
-            
-            if nom_valid:
-                # Nominatim is good
-                best_provider = 'nominatim'
-                best_lon = lon_nom
-                best_lat = lat_nom
-                status = 'ok'
-                notes.append(f'Nominatim within {dist_src_nom_m:.0f}m of source, confidence {nom_confidence}')
-            
-            elif g_valid:
-                # Google is good
-                best_provider = 'google'
-                best_lon = lon_g
-                best_lat = lat_g
-                status = 'ok'
-                notes.append(f'Google within {dist_src_g_m:.0f}m of source, confidence {g_confidence}')
-            
-            else:
-                # Neither is clearly good - pick the best we have
-                
-                # Calculate which one is better
-                nom_score = 0
-                g_score = 0
-                
-                if has_nom:
-                    nom_score = nom_confidence
-                    if dist_src_nom_m is not None:
-                        # Penalty for distance
-                        if dist_src_nom_m > suspicious_distance_m:
-                            nom_score -= 30
-                        elif dist_src_nom_m > ok_distance_m:
-                            nom_score -= 15
-                
-                if has_google:
-                    g_score = g_confidence
-                    if dist_src_g_m is not None:
-                        # Penalty for distance
-                        if dist_src_g_m > suspicious_distance_m:
-                            g_score -= 30
-                        elif dist_src_g_m > ok_distance_m:
-                            g_score -= 15
-                
-                # Pick the better one
-                if g_score > nom_score:
-                    best_provider = 'google'
-                    best_lon = lon_g
-                    best_lat = lat_g
-                    if dist_src_g_m is not None and dist_src_g_m > suspicious_distance_m:
-                        status = 'mismatch'
-                        notes.append(f'Google {dist_src_g_m:.0f}m from source (>5km)')
+            # Scenario 1: Both have wrong settlement
+            if nom_settlement_match == False and g_settlement_match == False:
+                # Both wrong settlement - pick based on confidence, mark as settlement_mismatch
+                if has_nom and has_google:
+                    if nom_confidence >= g_confidence:
+                        best_provider = 'nominatim'
+                        best_lon = lon_nom
+                        best_lat = lat_nom
                     else:
-                        status = 'needs_review'
-                        notes.append(f'Google {dist_src_g_m:.0f}m from source' if dist_src_g_m else 'Google result, distance unknown')
-                
-                elif nom_score > 0 and has_nom:
+                        best_provider = 'google'
+                        best_lon = lon_g
+                        best_lat = lat_g
+                elif has_nom:
                     best_provider = 'nominatim'
                     best_lon = lon_nom
                     best_lat = lat_nom
-                    if dist_src_nom_m is not None and dist_src_nom_m > suspicious_distance_m:
-                        status = 'mismatch'
-                        notes.append(f'Nominatim {dist_src_nom_m:.0f}m from source (>5km)')
-                    else:
-                        status = 'needs_review'
-                        notes.append(f'Nominatim {dist_src_nom_m:.0f}m from source' if dist_src_nom_m else 'Nominatim result, distance unknown')
+                else:
+                    best_provider = 'google'
+                    best_lon = lon_g
+                    best_lat = lat_g
+                
+                status = 'settlement_mismatch'
+                notes.append(f'Both providers returned wrong settlement (expected: {expected_settlement})')
+            
+            # Scenario 2: At least one has correct settlement (or no validation)
+            else:
+                # Filter out providers with wrong settlement
+                nom_available = has_nom and (nom_settlement_match is None or nom_settlement_match == True)
+                g_available = has_google and (g_settlement_match is None or g_settlement_match == True)
+                
+                # Check if any provider is "clearly good"
+                nom_valid = nom_available and dist_src_nom_m is not None and dist_src_nom_m <= ok_distance_m and nom_confidence >= min_confidence
+                g_valid = g_available and dist_src_g_m is not None and dist_src_g_m <= ok_distance_m and g_confidence >= min_confidence
+                
+                if nom_valid:
+                    # Nominatim is good
+                    best_provider = 'nominatim'
+                    best_lon = lon_nom
+                    best_lat = lat_nom
+                    status = 'ok'
+                    notes.append(f'Nominatim within {dist_src_nom_m:.0f}m of source, confidence {nom_confidence}')
+                    if nom_settlement_match:
+                        notes.append('Settlement match: OK')
+                
+                elif g_valid:
+                    # Google is good
+                    best_provider = 'google'
+                    best_lon = lon_g
+                    best_lat = lat_g
+                    status = 'ok'
+                    notes.append(f'Google within {dist_src_g_m:.0f}m of source, confidence {g_confidence}')
+                    if g_settlement_match:
+                        notes.append('Settlement match: OK')
                 
                 else:
-                    # Fallback to source
-                    best_provider = 'src'
-                    best_lon = lon_src
-                    best_lat = lat_src
-                    status = 'needs_review'
-                    notes.append('Using source coordinates - geocoding results not reliable')
+                    # Neither is "clearly good" - pick best available (with correct settlement)
+                    
+                    # Calculate scores
+                    nom_score = -999  # Very low default
+                    g_score = -999
+                    
+                    if nom_available:
+                        nom_score = nom_confidence
+                        if dist_src_nom_m is not None:
+                            # Penalty for distance
+                            if dist_src_nom_m > suspicious_distance_m:
+                                nom_score -= 30
+                            elif dist_src_nom_m > ok_distance_m:
+                                nom_score -= 15
+                    
+                    if g_available:
+                        g_score = g_confidence
+                        if dist_src_g_m is not None:
+                            # Penalty for distance
+                            if dist_src_g_m > suspicious_distance_m:
+                                g_score -= 30
+                            elif dist_src_g_m > ok_distance_m:
+                                g_score -= 15
+                    
+                    # Pick the better one (must have correct settlement)
+                    if g_score > nom_score and g_available:
+                        best_provider = 'google'
+                        best_lon = lon_g
+                        best_lat = lat_g
+                        
+                        if dist_src_g_m is not None and dist_src_g_m > suspicious_distance_m:
+                            status = 'mismatch'
+                            notes.append(f'Google {dist_src_g_m:.0f}m from source (>5km)')
+                        else:
+                            status = 'needs_review'
+                            notes.append(f'Google {dist_src_g_m:.0f}m from source' if dist_src_g_m else 'Google result, distance unknown')
+                        
+                        if g_settlement_match:
+                            notes.append('Settlement match: OK')
+                    
+                    elif nom_available:
+                        best_provider = 'nominatim'
+                        best_lon = lon_nom
+                        best_lat = lat_nom
+                        
+                        if dist_src_nom_m is not None and dist_src_nom_m > suspicious_distance_m:
+                            status = 'mismatch'
+                            notes.append(f'Nominatim {dist_src_nom_m:.0f}m from source (>5km)')
+                        else:
+                            status = 'needs_review'
+                            notes.append(f'Nominatim {dist_src_nom_m:.0f}m from source' if dist_src_nom_m else 'Nominatim result, distance unknown')
+                        
+                        if nom_settlement_match:
+                            notes.append('Settlement match: OK')
+                    
+                    elif g_available:
+                        # Only Google available
+                        best_provider = 'google'
+                        best_lon = lon_g
+                        best_lat = lat_g
+                        
+                        if dist_src_g_m is not None and dist_src_g_m > suspicious_distance_m:
+                            status = 'mismatch'
+                            notes.append(f'Google {dist_src_g_m:.0f}m from source (>5km)')
+                        else:
+                            status = 'needs_review'
+                            notes.append(f'Google result')
+                        
+                        if g_settlement_match:
+                            notes.append('Settlement match: OK')
+                    
+                    else:
+                        # No provider available with correct settlement - shouldn't happen
+                        # Pick best of what we have
+                        if has_nom and has_google:
+                            if nom_confidence >= g_confidence:
+                                best_provider = 'nominatim'
+                                best_lon = lon_nom
+                                best_lat = lat_nom
+                            else:
+                                best_provider = 'google'
+                                best_lon = lon_g
+                                best_lat = lat_g
+                        elif has_nom:
+                            best_provider = 'nominatim'
+                            best_lon = lon_nom
+                            best_lat = lat_nom
+                        else:
+                            best_provider = 'google'
+                            best_lon = lon_g
+                            best_lat = lat_g
+                        
+                        status = 'needs_review'
+                        notes.append('No settlement validation possible')
         
         else:
             # No source coordinates - just pick the best geocoded result
@@ -267,14 +479,17 @@ def compute_distances_and_status(config, limit=None):
                 notes.append(f'No source coords - using Nominatim (low confidence {nom_confidence})')
             
             else:
-                # Should not reach here
+                # Should not reach here - no geocoding results
                 status = 'not_found'
+                best_provider = None
+                best_lon = None
+                best_lat = None
                 notes.append('No coordinates available')
         
         # Update statistics
         if status:
             stats[status] += 1
-        if best_provider:
+        if best_provider and best_provider in ['nominatim', 'google']:
             stats[f'best_{best_provider}'] += 1
         
         # Prepare notes text
@@ -323,10 +538,10 @@ def compute_distances_and_status(config, limit=None):
     print(f"  - OK: {stats['ok']}")
     print(f"  - Needs review: {stats['needs_review']}")
     print(f"  - Mismatch: {stats['mismatch']}")
+    print(f"  - Settlement mismatch: {stats['settlement_mismatch']}")
     print(f"  - Not found: {stats['not_found']}")
     
     print(f"\nBest provider distribution:")
-    print(f"  - Source: {stats['best_src']}")
     print(f"  - Nominatim: {stats['best_nominatim']}")
     print(f"  - Google: {stats['best_google']}")
     print("="*60)

@@ -271,7 +271,8 @@ class GoogleGeocoder:
         params = {
             'address': address_query,
             'key': self.config['api_key'],
-            'region': 'bg'
+            'region': 'bg',
+            'language': 'bg'  # Request results in Bulgarian
         }
         
         try:
