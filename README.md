@@ -100,11 +100,46 @@ python scripts/02_geocode_hybrid.py
 - All Google results stored in `lon_g`, `lat_g`, `g_*` columns
 - Raw API responses stored in `nom_raw_json` and `g_raw_json`
 
+### 6. Compute Distances and Assign Status
+
+After geocoding, compute distances between coordinates and assign status:
+
+```bash
+# Test with 10 records
+python scripts/03_compute_distances.py --limit 10
+
+# Process all records
+python scripts/03_compute_distances.py
+```
+
+**What this script does:**
+- Computes distances (in meters) between:
+  - Source coordinates ↔ Nominatim
+  - Source coordinates ↔ Google
+  - Nominatim ↔ Google
+- Selects the **best coordinates** based on:
+  - Distance from source
+  - Confidence scores
+  - Intelligent scoring system
+- Assigns **status** to each record:
+  - `ok` - Within 1000m threshold, high confidence
+  - `needs_review` - 1000-5000m range or low confidence
+  - `mismatch` - >5000m from source (needs manual review)
+  - `not_found` - No geocoding results available
+
+**Results:**
+- Distances stored in `dist_src_nom_m`, `dist_src_g_m`, `dist_nom_g_m`
+- Best coordinates in `best_lon`, `best_lat`, `best_geom`
+- Status in `status` column
+- Decision notes in `notes` column
+
+**Expected runtime:** ~1 second for all records (very fast!)
+
 ## Scripts
 
 1. **01_import_excel_to_pg.py** - Import Excel data into PostgreSQL
 2. **02_geocode_hybrid.py** - Geocode using Nominatim first, then Google fallback
-3. **03_compute_distances.py** - Compute distances and assign status (coming soon)
+3. **03_compute_distances.py** - Compute distances and assign status
 4. **04_export_review_csv.py** - Export records needing review (coming soon)
 
 ## Cache Management
@@ -146,6 +181,23 @@ docker exec chitalishta_maps_db psql -U postgres -d chitalishta_maps -c "
          lon_g, lat_g, g_confidence
   FROM community_centers
   WHERE nom_queried_at IS NOT NULL
+  LIMIT 10;
+"
+
+# View status distribution
+docker exec chitalishta_maps_db psql -U postgres -d chitalishta_maps -c "
+  SELECT status, COUNT(*) as count
+  FROM community_centers
+  GROUP BY status
+  ORDER BY count DESC;
+"
+
+# View records needing review
+docker exec chitalishta_maps_db psql -U postgres -d chitalishta_maps -c "
+  SELECT id, name, settlement, dist_src_nom_m::int, dist_src_g_m::int, 
+         best_provider, status, notes
+  FROM community_centers
+  WHERE status IN ('needs_review', 'mismatch')
   LIMIT 10;
 "
 ```
