@@ -22,6 +22,36 @@ nominatim:
   
   # Rate limiting: 1 request per second (Nominatim policy)
   rate_limit_seconds: 1.0
+  
+  # Big cities optimization
+  # For major cities with detailed street-level data in OpenStreetMap,
+  # free-form queries with full address work better than structured queries
+  big_cities:
+    - "ГРАД СОФИЯ"
+    - "ГРАД ПЛОВДИВ"
+    - "ГРАД ВАРНА"
+    - "ГРАД БУРГАС"
+  
+  # Strategy for big cities geocoding
+  big_city_strategy:
+    # Try free-form query with full address FIRST (instead of structured query)
+    # This includes the street address in the query, giving better results
+    use_freeform_first: true
+    
+    # Minimum confidence threshold for accepting free-form results
+    # Lower than standard (60) because street-level results are valuable
+    min_confidence_for_freeform: 40
+    
+    # Result validation settings
+    validate_settlement_match: true      # Verify result is from expected city
+    prefer_building_results: true        # Prefer building/highway over administrative
+    reject_administrative_only: true     # Don't accept city center as final result
+    
+    # How many top results to check when validating (for future enhancement)
+    max_results_to_check: 3
+    
+    # Fallback behavior if free-form query fails or is rejected
+    fallback_to_structured: true         # Try structured query as fallback
 
 # Distance thresholds (in meters)
 thresholds:

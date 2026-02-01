@@ -158,6 +158,7 @@ class NominatimGeocoder:
     
     def __init__(self, config, cache_path):
         self.config = config['nominatim']
+        self.full_config = config  # Store full config for thresholds access
         self.cache = GeocoderCache(cache_path)
         self.last_request_time = 0
     
@@ -169,23 +170,105 @@ class NominatimGeocoder:
             time.sleep(rate_limit - elapsed)
         self.last_request_time = time.time()
     
+    def _is_big_city(self, settlement):
+        """
+        Check if settlement is configured as a big city.
+        
+        Args:
+            settlement: Settlement name (e.g., "ГРАД БУРГАС")
+        
+        Returns:
+            bool: True if settlement is in big_cities list
+        """
+        if not settlement:
+            return False
+        
+        big_cities = self.config.get('big_cities', [])
+        return settlement.strip() in big_cities
+    
+    def _validate_big_city_result(self, result_data, expected_settlement):
+        """
+        Validate that a free-form geocoding result is actually from the expected big city.
+        
+        For big cities, we want to ensure:
+        1. The result is from the correct city (not same street name in different city)
+        2. The result is specific (building/street), not just city center
+        3. Settlement name matches (with basic normalization)
+        
+        Args:
+            result_data: Dict from _nominatim_request_freeform
+            expected_settlement: Expected settlement (e.g., "ГРАД БУРГАС")
+        
+        Returns:
+            bool: True if result is valid for this big city
+        """
+        if not result_data or not result_data.get('success'):
+            return False
+        
+        strategy_config = self.config.get('big_city_strategy', {})
+        
+        # Check 1: Reject administrative-only results (these are usually city centers)
+        if strategy_config.get('reject_administrative_only', True):
+            osm_type = result_data.get('type', '')
+            osm_class = result_data.get('class', '')
+            
+            # Administrative boundary = city center, not specific address
+            if osm_type == 'administrative' or osm_class == 'boundary':
+                return False
+        
+        # Check 2: Prefer building/highway results (actual addresses)
+        if strategy_config.get('prefer_building_results', True):
+            osm_type = result_data.get('type', '')
+            osm_class = result_data.get('class', '')
+            
+            # These types indicate specific locations
+            preferred_classes = ['building', 'highway', 'amenity', 'shop', 'office', 'tourism']
+            preferred_types = ['building', 'residential', 'house', 'commercial', 'yes']
+            
+            is_specific = (osm_class in preferred_classes or osm_type in preferred_types)
+            
+            # If it's not specific, require higher confidence
+            if not is_specific and result_data.get('confidence', 0) < 70:
+                return False
+        
+        # Check 3: Validate settlement match (basic check)
+        if strategy_config.get('validate_settlement_match', True):
+            # Extract settlement from Nominatim response
+            raw_json = result_data.get('raw_json', {})
+            address_parts = extract_nominatim_address_parts(raw_json)
+            nom_settlement = address_parts[0]  # Returns tuple (settlement, municipality, region)
+            
+            # Normalize expected settlement (remove "ГРАД" prefix)
+            expected_clean = expected_settlement.replace('ГРАД ', '').replace('СЕЛО ', '').strip().upper()
+            
+            # Basic settlement matching
+            if nom_settlement:
+                nom_clean = nom_settlement.upper().strip()
+                # Check if settlements match (either contains the other)
+                if expected_clean not in nom_clean and nom_clean not in expected_clean:
+                    # Settlement doesn't match - this might be wrong city
+                    return False
+        
+        return True
+    
     def geocode(self, address_query, settlement=None, municipality=None):
         """
         Geocode an address using Nominatim with fallback strategies.
+        
+        NEW: For big cities (София, Пловдив, Варна, Бургас), tries free-form query
+        with full address FIRST, as this provides better street-level results than
+        structured queries which only include city+county.
 
         Uses trusted Excel data (settlement, municipality) to disambiguate:
-        when both are present, tries Nominatim structured search first
-        (city=settlement, county=municipality, country=Bulgaria) so the result
-        is from the correct municipality. Does not use source coordinates.
+        - Big cities: free-form first (with validation) → structured fallback → other fallbacks
+        - Small settlements: structured first → free-form fallbacks (current behavior)
 
-        Tries:
-        1. Structured search (city + county + country) when settlement and municipality present
-        2. Full address query (free-form)
-        3. Settlement + municipality, България (free-form)
-        4. Just settlement, България (free-form)
+        Query strategies:
+        1. Big cities: Free-form with full address (validated) → Structured → Other fallbacks
+        2. Small settlements: Structured → Free-form fallbacks (current behavior)
 
         Returns:
-            dict with keys: success, lat, lon, raw_json, confidence
+            dict with keys: success, lat, lon, raw_json, confidence, query_used
         """
         # Normalize municipality to a short name for structured search (Excel often has
         # long strings like "община БУРГАС СЕЛО ИЗВОР Михаи"; Nominatim needs "Бургас")
@@ -205,6 +288,7 @@ class NominatimGeocoder:
         if settlement:
             settlement_clean = settlement.replace('СЕЛО ', '').replace('ГРАД ', '').strip()
 
+        # Prepare fallback queries
         queries_to_try = [address_query]
         if settlement_clean and municipality_clean:
             queries_to_try.append(f"{settlement_clean}, {municipality_clean}, България")
@@ -212,17 +296,59 @@ class NominatimGeocoder:
             queries_to_try.append(f"{settlement_clean}, България")
 
         result_data = None
+        
+        # Determine if this is a big city
+        is_big_city = self._is_big_city(settlement)
+        strategy_config = self.config.get('big_city_strategy', {})
 
-        # 1) Structured search when we have settlement + normalized municipality (short name)
-        if settlement_clean and municipality_for_structured:
-            result_data = self._nominatim_request_structured(
-                city=settlement_clean,
-                county=municipality_for_structured,
-                country='Bulgaria',
+        # ============================================================
+        # BIG CITY PATH: Free-form with full address FIRST
+        # ============================================================
+        if is_big_city and strategy_config.get('use_freeform_first', True):
+            # Try free-form query with the full address first
+            result_data = self._nominatim_request_freeform(
+                query=address_query,
                 address_query=address_query
             )
+            
+            # Validate the result
+            if result_data and self._validate_big_city_result(result_data, settlement):
+                # Good result from free-form query - use it!
+                self.cache.set(cache_key, result_data)
+                return result_data
+            
+            # Free-form didn't work well, try structured as fallback
+            if strategy_config.get('fallback_to_structured', True):
+                if settlement_clean and municipality_for_structured:
+                    result_data = self._nominatim_request_structured(
+                        city=settlement_clean,
+                        county=municipality_for_structured,
+                        country='Bulgaria',
+                        address_query=address_query
+                    )
+                    if result_data is not None:
+                        self.cache.set(cache_key, result_data)
+                        return result_data
 
-        # 2) Free-form fallbacks
+        # ============================================================
+        # SMALL SETTLEMENT PATH: Structured query FIRST (current behavior)
+        # ============================================================
+        else:
+            # Current logic: try structured first for small settlements
+            if settlement_clean and municipality_for_structured:
+                result_data = self._nominatim_request_structured(
+                    city=settlement_clean,
+                    county=municipality_for_structured,
+                    country='Bulgaria',
+                    address_query=address_query
+                )
+                if result_data is not None:
+                    self.cache.set(cache_key, result_data)
+                    return result_data
+
+        # ============================================================
+        # COMMON FALLBACKS: Try other query variations
+        # ============================================================
         if result_data is None:
             for query_attempt in queries_to_try:
                 result_data = self._nominatim_request_freeform(
@@ -231,6 +357,7 @@ class NominatimGeocoder:
                 if result_data is not None:
                     break
 
+        # No results found
         if result_data is None:
             result_data = {
                 'success': False,
@@ -341,42 +468,86 @@ class NominatimGeocoder:
         """
         Calculate confidence score (0-100) for Nominatim result.
         
-        Heuristic:
+        NEW: Boosts confidence for building/highway results (specific locations).
+        Penalizes administrative boundaries (city centers) for big cities.
+        
+        Factors:
         - Base score: 40 if result exists
-        - +20 if class/type indicates street or building (not just municipality)
-        - +10 if importance >= 0.4
-        - +20 if settlement name appears in display_name
-        - +10 if osm_type is 'way' or 'node' (precise locations)
+        - OSM type (building/highway = specific, administrative = generic)
+        - Address component completeness (house number, street)
+        - OSM importance score
+        - Result precision (way/node vs relation)
         """
         score = 40  # Base score for having a result
         
-        # Check if it's a precise location (not just administrative)
+        # Factor 1: Result type specificity (NEW: enhanced scoring)
         osm_class = result.get('class', '').lower()
         osm_type = result.get('type', '').lower()
         
-        if osm_class in ['building', 'amenity', 'tourism', 'leisure']:
+        # Building results are most specific
+        if osm_class == 'building' or osm_type == 'building':
             score += 20
-        elif osm_class == 'highway' or osm_type in ['house', 'residential', 'commercial']:
+        elif osm_type in ['house', 'yes', 'residential', 'commercial', 'apartments']:
             score += 15
-        elif osm_class == 'place' and osm_type in ['village', 'town', 'city']:
-            score += 5  # Just a municipality/settlement, less precise
-        
-        # Check importance
-        importance = result.get('importance', 0)
-        if importance >= 0.4:
+        # Highway/street results are very good for addresses
+        elif osm_class == 'highway':
+            score += 15
+        elif osm_type in ['residential', 'pedestrian', 'service', 'unclassified']:
             score += 10
+        # Amenities and places are good
+        elif osm_class in ['amenity', 'tourism', 'leisure', 'shop', 'office']:
+            score += 12
+        # Place types - depends on specificity
+        elif osm_class == 'place':
+            if osm_type in ['village', 'town', 'city']:
+                score += 5  # Just a municipality/settlement, less precise
+            elif osm_type in ['neighbourhood', 'suburb', 'quarter']:
+                score += 8  # More specific than city
+        # Administrative boundaries are too generic (city centers)
+        elif osm_class == 'boundary' or osm_type == 'administrative':
+            score -= 15  # Penalize - usually city center
         
-        # Check OSM type (way/node are more precise than relation)
-        result_osm_type = result.get('osm_type', '').lower()
-        if result_osm_type in ['way', 'node']:
-            score += 10
-        
-        # Bonus for having address details
+        # Factor 2: Address component completeness
         address = result.get('address', {})
-        if address.get('house_number') or address.get('street') or address.get('road'):
-            score += 10
+        if address:
+            # House number is very specific
+            if address.get('house_number') or address.get('building'):
+                score += 15
+            # Street/road name is good
+            if address.get('street') or address.get('road'):
+                score += 8
+            # Neighbourhood/suburb adds specificity
+            if address.get('neighbourhood') or address.get('suburb') or address.get('quarter'):
+                score += 5
         
-        return min(score, 100)  # Cap at 100
+        # Factor 3: OSM importance (0.0 to 1.0, typically)
+        importance = result.get('importance', 0)
+        if importance:
+            score += int(importance * 15)  # Max +15 points
+        
+        # Factor 4: OSM geometry type (way/node are more precise than relation)
+        result_osm_type = result.get('osm_type', '').lower()
+        if result_osm_type == 'node':
+            score += 8  # Point location - very precise
+        elif result_osm_type == 'way':
+            score += 5  # Line or polygon - precise
+        elif result_osm_type == 'relation':
+            score -= 5  # Usually administrative areas - less precise
+        
+        # Factor 5: Display name specificity (more commas = more specific)
+        display_name = result.get('display_name', '')
+        comma_count = display_name.count(',')
+        if comma_count >= 5:
+            score += 8
+        elif comma_count >= 4:
+            score += 5
+        elif comma_count >= 3:
+            score += 3
+        
+        # Clamp to 0-100 range
+        confidence = max(0, min(100, score))
+        
+        return confidence
     
     def close(self):
         """Close cache connection."""
