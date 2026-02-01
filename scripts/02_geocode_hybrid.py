@@ -26,6 +26,86 @@ from sqlalchemy import create_engine, text
 from tqdm import tqdm
 
 
+def extract_nominatim_address_parts(raw_result):
+    """
+    Extract settlement, municipality, and region from Nominatim API result address object.
+
+    The result is the raw API place object (with 'address' when addressdetails=1).
+    Nominatim address keys vary by location; we check common keys for each level.
+
+    Returns:
+        tuple: (nom_settlement, nom_municipality, nom_region) - any may be None
+    """
+    if not raw_result or not isinstance(raw_result, dict):
+        return (None, None, None)
+    address = raw_result.get('address') or {}
+    if not isinstance(address, dict):
+        return (None, None, None)
+
+    # Settlement: village, town, city (OSM place levels); fallback locality
+    settlement = (
+        address.get('village') or
+        address.get('town') or
+        address.get('city') or
+        address.get('locality')
+    )
+    if settlement and isinstance(settlement, str):
+        settlement = settlement.strip() or None
+    else:
+        settlement = None
+
+    # Municipality (община): municipality or county
+    municipality = address.get('municipality') or address.get('county')
+    if municipality and isinstance(municipality, str):
+        municipality = municipality.strip() or None
+    else:
+        municipality = None
+
+    # Region (област): state, state_district, region
+    region = (
+        address.get('state') or
+        address.get('state_district') or
+        address.get('region')
+    )
+    if region and isinstance(region, str):
+        region = region.strip() or None
+    else:
+        region = None
+
+    return (settlement, municipality, region)
+
+
+def normalize_municipality_for_nominatim(municipality):
+    """
+    Normalize Excel "Община" value to a short name suitable for Nominatim structured search (county).
+
+    Excel often has long strings like "община БУРГАС СЕЛО ИЗВОР Михаи" (address fragment).
+    Nominatim only matches real admin names (e.g. "Бургас"), so we extract the first
+    meaningful word after "община " to use as county= in structured search.
+    """
+    if not municipality or not isinstance(municipality, str):
+        return None
+    s = municipality.strip()
+    if not s:
+        return None
+    # Strip leading "община " (case-insensitive)
+    for prefix in ('община ', 'ОБЩИНА ', 'Община '):
+        if s.upper().startswith(prefix.upper()):
+            s = s[len(prefix):].strip()
+            break
+    if not s:
+        return None
+    words = s.split()
+    # Skip leading settlement-type tokens (СЕЛО, ГРАД, etc.) so we get the actual municipality name
+    skip = ('СЕЛО', 'ГРАД', 'С.', 'ГР.')
+    while words and words[0].upper().strip() in skip:
+        words = words[1:]
+    first_word = words[0] if words else None
+    if not first_word or len(first_word) > 80:
+        return None
+    return first_word.strip()
+
+
 class GeocoderCache:
     """SQLite cache for geocoding responses."""
     
@@ -92,102 +172,65 @@ class NominatimGeocoder:
     def geocode(self, address_query, settlement=None, municipality=None):
         """
         Geocode an address using Nominatim with fallback strategies.
-        
+
+        Uses trusted Excel data (settlement, municipality) to disambiguate:
+        when both are present, tries Nominatim structured search first
+        (city=settlement, county=municipality, country=Bulgaria) so the result
+        is from the correct municipality. Does not use source coordinates.
+
         Tries:
-        1. Full address query
-        2. Settlement + municipality (if street address fails)
-        3. Just settlement (if still no results)
-        
+        1. Structured search (city + county + country) when settlement and municipality present
+        2. Full address query (free-form)
+        3. Settlement + municipality, България (free-form)
+        4. Just settlement, България (free-form)
+
         Returns:
             dict with keys: success, lat, lon, raw_json, confidence
         """
-        # Check cache first (using full address as key)
-        cached = self.cache.get(address_query)
+        # Normalize municipality to a short name for structured search (Excel often has
+        # long strings like "община БУРГАС СЕЛО ИЗВОР Михаи"; Nominatim needs "Бургас")
+        municipality_for_structured = normalize_municipality_for_nominatim(municipality)
+        municipality_clean = municipality.strip() if municipality else None
+
+        # Cache key: include municipality when present so same address in different
+        # municipalities do not share a cached result (use normalized name when available)
+        cache_key = address_query
+        if municipality:
+            cache_key = f"{address_query}|municipality:{municipality_for_structured or municipality_clean or ''}"
+        cached = self.cache.get(cache_key)
         if cached is not None:
             return cached
-        
-        # Try different query strategies
-        queries_to_try = [address_query]
-        
-        # Add fallback queries
-        if settlement and municipality:
-            # Clean settlement/municipality names
-            settlement_clean = settlement.replace('СЕЛО ', '').replace('ГРАД ', '').strip()
-            municipality_clean = municipality.strip()
-            
-            if settlement_clean and municipality_clean:
-                queries_to_try.append(f"{settlement_clean}, {municipality_clean}, България")
-        
+
+        settlement_clean = None
         if settlement:
             settlement_clean = settlement.replace('СЕЛО ', '').replace('ГРАД ', '').strip()
-            if settlement_clean:
-                queries_to_try.append(f"{settlement_clean}, България")
-        
+
+        queries_to_try = [address_query]
+        if settlement_clean and municipality_clean:
+            queries_to_try.append(f"{settlement_clean}, {municipality_clean}, България")
+        if settlement_clean:
+            queries_to_try.append(f"{settlement_clean}, България")
+
         result_data = None
-        
-        for query_attempt in queries_to_try:
-            # Rate limit
-            self._rate_limit()
-            
-            # Make request to Nominatim
-            params = {
-                'q': query_attempt,
-                'format': 'jsonv2',
-                'countrycodes': 'bg',
-                'limit': 1,
-                'addressdetails': 1
-            }
-            
-            headers = {
-                'User-Agent': self.config['user_agent']
-            }
-            
-            try:
-                response = requests.get(
-                    self.config['base_url'],
-                    params=params,
-                    headers=headers,
-                    timeout=10
+
+        # 1) Structured search when we have settlement + normalized municipality (short name)
+        if settlement_clean and municipality_for_structured:
+            result_data = self._nominatim_request_structured(
+                city=settlement_clean,
+                county=municipality_for_structured,
+                country='Bulgaria',
+                address_query=address_query
+            )
+
+        # 2) Free-form fallbacks
+        if result_data is None:
+            for query_attempt in queries_to_try:
+                result_data = self._nominatim_request_freeform(
+                    query_attempt, address_query
                 )
-                response.raise_for_status()
-                
-                results = response.json()
-                
-                if results and len(results) > 0:
-                    result = results[0]
-                    
-                    # Extract data
-                    lat = float(result.get('lat', 0))
-                    lon = float(result.get('lon', 0))
-                    
-                    # Calculate confidence
-                    confidence = self._calculate_confidence(result, address_query)
-                    
-                    # Reduce confidence if we had to use a fallback query
-                    if query_attempt != address_query:
-                        confidence = max(confidence - 20, 30)  # Penalty for fallback
-                    
-                    result_data = {
-                        'success': True,
-                        'lat': lat,
-                        'lon': lon,
-                        'display_name': result.get('display_name'),
-                        'osm_type': result.get('osm_type'),
-                        'osm_id': result.get('osm_id'),
-                        'importance': result.get('importance'),
-                        'class': result.get('class'),
-                        'type': result.get('type'),
-                        'confidence': confidence,
-                        'raw_json': result,
-                        'query_used': query_attempt  # Track which query worked
-                    }
-                    break  # Success, stop trying
-                    
-            except Exception as e:
-                # Try next query
-                continue
-        
-        # If no queries worked
+                if result_data is not None:
+                    break
+
         if result_data is None:
             result_data = {
                 'success': False,
@@ -197,10 +240,102 @@ class NominatimGeocoder:
                 'raw_json': {'error': 'No results found for any query strategy'},
                 'queries_tried': queries_to_try
             }
-        
-        # Cache the result (including failures)
-        self.cache.set(address_query, result_data)
+
+        self.cache.set(cache_key, result_data)
         return result_data
+
+    def _nominatim_request_structured(self, city, county, country, address_query):
+        """
+        Nominatim structured search (city, county, country). Cannot be combined with q=.
+        Use when we have trusted settlement + municipality so result is from correct municipality.
+        """
+        self._rate_limit()
+        params = {
+            'city': city,
+            'county': county,
+            'country': country,
+            'format': 'jsonv2',
+            'countrycodes': 'bg',
+            'limit': 1,
+            'addressdetails': 1
+        }
+        headers = {'User-Agent': self.config['user_agent']}
+        try:
+            response = requests.get(
+                self.config['base_url'],
+                params=params,
+                headers=headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            results = response.json()
+            if not results or len(results) == 0:
+                return None
+            result = results[0]
+            lat = float(result.get('lat', 0))
+            lon = float(result.get('lon', 0))
+            confidence = self._calculate_confidence(result, address_query)
+            return {
+                'success': True,
+                'lat': lat,
+                'lon': lon,
+                'display_name': result.get('display_name'),
+                'osm_type': result.get('osm_type'),
+                'osm_id': result.get('osm_id'),
+                'importance': result.get('importance'),
+                'class': result.get('class'),
+                'type': result.get('type'),
+                'confidence': confidence,
+                'raw_json': result,
+                'query_used': f"structured:{city},{county},{country}"
+            }
+        except Exception:
+            return None
+
+    def _nominatim_request_freeform(self, query_attempt, address_query):
+        """Nominatim free-form search (q=)."""
+        self._rate_limit()
+        params = {
+            'q': query_attempt,
+            'format': 'jsonv2',
+            'countrycodes': 'bg',
+            'limit': 1,
+            'addressdetails': 1
+        }
+        headers = {'User-Agent': self.config['user_agent']}
+        try:
+            response = requests.get(
+                self.config['base_url'],
+                params=params,
+                headers=headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            results = response.json()
+            if not results or len(results) == 0:
+                return None
+            result = results[0]
+            lat = float(result.get('lat', 0))
+            lon = float(result.get('lon', 0))
+            confidence = self._calculate_confidence(result, address_query)
+            if query_attempt != address_query:
+                confidence = max(confidence - 20, 30)
+            return {
+                'success': True,
+                'lat': lat,
+                'lon': lon,
+                'display_name': result.get('display_name'),
+                'osm_type': result.get('osm_type'),
+                'osm_id': result.get('osm_id'),
+                'importance': result.get('importance'),
+                'class': result.get('class'),
+                'type': result.get('type'),
+                'confidence': confidence,
+                'raw_json': result,
+                'query_used': query_attempt
+            }
+        except Exception:
+            return None
     
     def _calculate_confidence(self, result, address_query):
         """
@@ -453,9 +588,13 @@ def geocode_records(config, limit=None, municipality_limit=None):
             print(f"\n[WARNING] Record {record_id} has no address_query, skipping")
             continue
         
-        # Step 1: Try Nominatim (with fallback strategies)
+        # Step 1: Try Nominatim (structured by settlement+municipality when trusted, then fallbacks)
         nom_result = nominatim.geocode(address_query, settlement, municipality)
         
+        # Extract settlement, municipality, region from Nominatim address for storage
+        raw_json = nom_result.get('raw_json') or {}
+        nom_settlement, nom_municipality, nom_region = extract_nominatim_address_parts(raw_json)
+
         # Always store Nominatim result
         with engine.connect() as conn:
             update_query = text("""
@@ -476,6 +615,10 @@ def geocode_records(config, limit=None, municipality_limit=None):
                     nom_type = :type,
                     nom_confidence = :confidence,
                     nom_raw_json = :raw_json,
+                    nom_settlement = :nom_settlement,
+                    nom_municipality = :nom_municipality,
+                    nom_region = :nom_region,
+                    nom_query_used = :nom_query_used,
                     nom_queried_at = NOW(),
                     updated_at = NOW()
                 WHERE id = :id
@@ -492,7 +635,11 @@ def geocode_records(config, limit=None, municipality_limit=None):
                 'class': nom_result.get('class'),
                 'type': nom_result.get('type'),
                 'confidence': nom_result.get('confidence', 0),
-                'raw_json': json.dumps(nom_result.get('raw_json', {}))
+                'raw_json': json.dumps(raw_json),
+                'nom_settlement': nom_settlement,
+                'nom_municipality': nom_municipality,
+                'nom_region': nom_region,
+                'nom_query_used': nom_result.get('query_used'),
             })
             conn.commit()
         

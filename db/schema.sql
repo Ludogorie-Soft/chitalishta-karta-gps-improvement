@@ -46,6 +46,10 @@ CREATE TABLE community_centers (
     nom_type TEXT,
     nom_confidence SMALLINT,  -- 0-100, computed score
     nom_raw_json JSONB,  -- Always populated after query (even if empty result)
+    nom_settlement TEXT,  -- Extracted from Nominatim address (e.g. Нивянин, Кермен)
+    nom_municipality TEXT,  -- Extracted from Nominatim address (e.g. Радомир, Сливен)
+    nom_region TEXT,  -- Extracted from Nominatim address (e.g. Враца, Перник)
+    nom_query_used TEXT,  -- Query actually sent to Nominatim: "structured:city,county,country" or free-form string
     nom_queried_at TIMESTAMPTZ,  -- Timestamp of Nominatim query attempt
 
     -- ========================================
